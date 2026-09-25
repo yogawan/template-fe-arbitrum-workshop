@@ -10,12 +10,19 @@
 
 // 1. IMPORT DEPENDENSI & KOMPONEN
 // Mengimpor hook React untuk manajemen state, kelima komponen anak, dan stylesheet.
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { ethers } from 'ethers';
 import Navbar from './components/Navbar';
 import PropertyCard from './components/PropertyCard';
 import InvestorPortfolio from './components/InvestorPortfolio';
 import InvestBox from './components/InvestBox';
 import TransactionHistory from './components/TransactionHistory';
+import {
+  PROPERTY_CONTRACT_ADDRESS,
+  FRACTIONAL_PROPERTY_ABI,
+  ARBITRUM_SEPOLIA_HEX_ID,
+  ARBITRUM_SEPOLIA_NETWORK_PARAMS
+} from './constants/contract';
 import './App.css';
 
 export default function App() {
@@ -43,8 +50,11 @@ export default function App() {
   // • cooldownSeconds: Sisa waktu jeda anti-spam (0 = siap melakukan transaksi).
   // ---------------------------------------------------------------------------
   const [account, setAccount] = useState(null);
-  const [myFractions, setMyFractions] = useState(10);
+  const [myFractions, setMyFractions] = useState(0);
   const [cooldownSeconds, setCooldownSeconds] = useState(0);
+
+  // isConnecting: Status loading true/false saat pop-up MetaMask sedang menunggu otorisasi user.
+  const [isConnecting, setIsConnecting] = useState(false);
 
   // Hook timer hitung mundur otomatis untuk periode cooldown anti-spam
   useEffect(() => {
@@ -120,38 +130,163 @@ export default function App() {
   };
 
   // ---------------------------------------------------------------------------
-  // 7. HANDLER KONEKSI DOMPET (PADA MODE MOCK TEMPLATE)
+  // 7. HELPER PROVIDER ANTI-TABRAKAN EKSTENSI MULTI-WALLET
   // ---------------------------------------------------------------------------
-  // Pada tahap template ini, tombol Connect Wallet menampilkan pop-up panduan simulasi.
-  // 👉 Untuk menggantinya dengan koneksi MetaMask asli & auto-switch ke Arbitrum Sepolia,
-  //    silakan ikuti Langkah 3.4 pada file `PANDUAN-INTEGRASI-ONCHAIN.md`!
+  // Banyak ekstensi dompet Web3 (Rabby, Coinbase Wallet, Phantom EVM, OKX Wallet,
+  // Trust Wallet) otomatis menyetel flag `isMetaMask = true` ke `window.ethereum`
+  // agar dApp lawas tetap berfungsi. Fungsi ini menyaring array `window.ethereum.providers`
+  // secara ketat agar browser memilih instance MetaMask asli.
   // ---------------------------------------------------------------------------
-  const handleConnectWallet = () => {
-    alert(
-      "ℹ️ Mode Mock Frontend:\n" +
-      "Fitur Connect Wallet (MetaMask) dinonaktifkan pada template awal ini.\n" +
-      "Seluruh data dan transaksi saat ini berjalan dalam mode simulasi lokal.\n\n" +
-      "Ikuti panduan di PANDUAN-INTEGRASI-ONCHAIN.md untuk menghubungkannya ke MetaMask & Smart Contract riil!"
-    );
+  const getProvider = () => {
+    if (typeof window === 'undefined' || !window.ethereum) return undefined;
+
+    if (window.ethereum.providers?.length) {
+      const realMetaMask = window.ethereum.providers.find(
+        (p) =>
+          p.isMetaMask &&
+          !p.isRabby &&
+          !p.isCoinbaseWallet &&
+          !p.isPhantom &&
+          !p.isOkxWallet &&
+          !p.isTrustWallet &&
+          !p.isBraveWallet
+      );
+      if (realMetaMask) return realMetaMask;
+    }
+
+    return window.ethereum;
   };
 
   // ---------------------------------------------------------------------------
-  // 8. HANDLER TRANSAKSI INVESTASI PEMBELIAN FRAKSI (PADA MODE MOCK TEMPLATE)
+  // 8. HANDLER KONEKSI DOMPET (MODE ON-CHAIN)
   // ---------------------------------------------------------------------------
-  // Menyimulasikan alur transaksi on-chain:
-  // 1. Memvalidasi ketersediaan kuota fraksi.
-  // 2. Mengaktifkan status loading (isTransacting = true).
-  // 3. Menunggu jeda waktu (setTimeout 1 detik) seolah memproses blok di blockchain.
-  // 4. Memotong sisa kuota, menambah saldo unit investor, dan membuat hash transaksi acak.
-  // 👉 Untuk menggantinya dengan transaksi on-chain riil via Smart Contract `buyFractions()`,
-  //    silakan ikuti Langkah 3.6 pada file `PANDUAN-INTEGRASI-ONCHAIN.md`!
+  // Meminta akses akun MetaMask riil (`eth_requestAccounts`) dan memastikan
+  // jaringan aktif adalah Arbitrum Sepolia sebelum melanjutkan.
   // ---------------------------------------------------------------------------
-  const handleInvest = (quantity) => {
+  const ensureArbitrumNetwork = async () => {
+    const provider = getProvider();
+    if (!provider) return;
+    try {
+      await provider.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: ARBITRUM_SEPOLIA_HEX_ID }]
+      });
+    } catch (err) {
+      // Error 4902: Jaringan belum terdaftar di MetaMask, minta daftarkan otomatis
+      if (err.code === 4902) {
+        await provider.request({
+          method: 'wallet_addEthereumChain',
+          params: [ARBITRUM_SEPOLIA_NETWORK_PARAMS]
+        });
+      } else {
+        throw err;
+      }
+    }
+  };
+
+  const handleConnectWallet = async () => {
+    const provider = getProvider();
+    if (!provider) {
+      alert("Ekstensi MetaMask tidak terdeteksi! Silakan instal MetaMask.");
+      return;
+    }
+
+    try {
+      setIsConnecting(true);
+      const accounts = await provider.request({ method: 'eth_requestAccounts' });
+      await ensureArbitrumNetwork();
+
+      const connectedAddr = accounts[0];
+      setAccount(connectedAddr);
+      await fetchBlockchainData(connectedAddr);
+    } catch (err) {
+      console.error("Gagal menghubungkan wallet:", err);
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // 9. READ CALLS: MEMBACA DATA ON-CHAIN (GRATIS GAS)
+  // ---------------------------------------------------------------------------
+  // Membaca fungsi view (propertyName, availableFractions, dsb.) secara otomatis
+  // setiap kali web pertama kali dibuka atau akun dompet berubah.
+  // ---------------------------------------------------------------------------
+  const fetchBlockchainData = useCallback(async (userAddr) => {
+    const providerObj = getProvider();
+    if (!providerObj || !PROPERTY_CONTRACT_ADDRESS) return;
+
+    try {
+      const provider = new ethers.BrowserProvider(providerObj);
+      const contract = new ethers.Contract(
+        PROPERTY_CONTRACT_ADDRESS,
+        FRACTIONAL_PROPERTY_ABI,
+        provider
+      );
+
+      // Baca data umum properti
+      const [name, sym, docURI, priceWei, total, available] = await Promise.all([
+        contract.propertyName(),
+        contract.propertySymbol(),
+        contract.propertyDocumentURI(),
+        contract.fractionPrice(),
+        contract.totalFractions(),
+        contract.availableFractions()
+      ]);
+
+      setPropertyName(name);
+      setSymbol(sym);
+      setDocumentURI(docURI);
+      setPriceEth(ethers.formatEther(priceWei));
+      setTotalFractions(Number(total));
+      setAvailableFractions(Number(available));
+
+      // Baca saldo fraksi & waktu cooldown investor jika akun sudah terhubung
+      if (userAddr) {
+        const [bal, lastTime, cooldownPeriod] = await Promise.all([
+          contract.getInvestorFractions(userAddr),
+          contract.lastInvestmentTime(userAddr),
+          contract.COOLDOWN_PERIOD()
+        ]);
+        setMyFractions(Number(bal));
+
+        // Hitung sisa detik cooldown berdasarkan waktu on-chain
+        const nowSec = Math.floor(Date.now() / 1000);
+        const remaining = (Number(lastTime) + Number(cooldownPeriod)) - nowSec;
+        if (remaining > 0 && Number(lastTime) > 0) {
+          setCooldownSeconds(remaining);
+        } else {
+          setCooldownSeconds(0);
+        }
+      }
+    } catch (err) {
+      console.error("Gagal membaca data on-chain:", err);
+    }
+  }, []);
+
+  // Hook untuk memicu pembacaan data otomatis saat aplikasi dimuat / akun berubah
+  useEffect(() => {
+    fetchBlockchainData(account);
+  }, [account, fetchBlockchainData]);
+
+  // ---------------------------------------------------------------------------
+  // 10. WRITE CALLS: TRANSAKSI PEMBELIAN FRAKSI DENGAN BUFFER GAS ARBITRUM L2
+  // ---------------------------------------------------------------------------
+  // Arbitrum L2 memproduksi blok sub-detik (~250ms) sehingga `baseFee` berfluktuasi
+  // cepat. Buffer `maxFeePerGas: 150%` dari `provider.getFeeData()` wajib dilakukan
+  // untuk mencegah error: "max fee per gas less than block base fee".
+  // ---------------------------------------------------------------------------
+  const handleInvest = async (quantity) => {
+    if (!account) {
+      alert("Harap hubungkan dompet MetaMask terlebih dahulu!");
+      return;
+    }
+
     // 1. Validasi Periode Cooldown Anti-Spam
     if (cooldownSeconds > 0) {
       setTxStatus({
         type: 'error',
-        message: `Revert Cooldown: Harap tunggu periode cooldown selesai (${cooldownSeconds} detik lagi)!`
+        message: `Harap tunggu periode cooldown selesai (${cooldownSeconds} detik lagi)!`
       });
       return;
     }
@@ -164,44 +299,92 @@ export default function App() {
       return;
     }
 
-    setIsTransacting(true);
-    setTxStatus({
-      type: 'info',
-      message: 'Simulasi: Memproses pengiriman transaksi investasi di Arbitrum Sepolia...'
-    });
-    setTxHash(null);
+    try {
+      setIsTransacting(true);
+      setTxStatus({
+        type: 'info',
+        message: 'Menunggu persetujuan transaksi di MetaMask...'
+      });
+      setTxHash(null);
 
-    // Simulasi waktu tunggu sequencer Layer-2 Arbitrum (~1 detik)
-    setTimeout(() => {
-      setIsTransacting(false);
-      setAvailableFractions((prev) => Math.max(0, prev - quantity));
-      setMyFractions((prev) => prev + quantity);
+      const activeProvider = getProvider() || window.ethereum;
+      const provider = new ethers.BrowserProvider(activeProvider);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(
+        PROPERTY_CONTRACT_ADDRESS,
+        FRACTIONAL_PROPERTY_ABI,
+        signer
+      );
 
-      // Aktifkan periode cooldown 10 detik setelah transaksi berhasil
+      // 1. Hitung total nilai ETH (harga per lembar fraksi x jumlah)
+      const costWei = ethers.parseEther((quantity * parseFloat(priceEth)).toFixed(4));
+
+      // 2. Ambil data gas fee saat ini dan beri buffer 50% (Anti-Revert BaseFee L2)
+      const feeData = await provider.getFeeData();
+      const maxFeePerGas = feeData.maxFeePerGas
+        ? (feeData.maxFeePerGas * 150n) / 100n
+        : undefined;
+      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas
+        ? (feeData.maxPriorityFeePerGas * 150n) / 100n
+        : undefined;
+
+      // 3. Kirim transaksi dengan parameter gas yang aman
+      const tx = await contract.buyFractions(quantity, {
+        value: costWei,
+        gasLimit: 350000n,
+        maxFeePerGas,
+        maxPriorityFeePerGas
+      });
+
+      setTxStatus({
+        type: 'info',
+        message: 'Transaksi dikirim ke sequencer Arbitrum (~1-2 detik)...'
+      });
+
+      // 4. Tunggu konfirmasi blok on-chain
+      const receipt = await tx.wait();
+      setTxHash(tx.hash);
+
+      // 5. Aktifkan timer hitung mundur cooldown 10 detik di UI
       setCooldownSeconds(10);
 
-      // Membuat hash transaksi tiruan sepanjang 64 karakter heksadesimal
-      const mockHash = '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-      setTxHash(mockHash);
-
-      // Catat ke riwayat transaksi lokal
       addTransaction({
-        hash: mockHash,
+        hash: tx.hash,
         type: 'Beli Fraksi',
-        description: `Pembelian ${quantity} Lembar Fraksi (${(quantity * 0.001).toFixed(3)} ETH)`,
+        description: `Beli ${quantity} Lembar Fraksi (${(quantity * parseFloat(priceEth)).toFixed(3)} ETH)`,
         timestamp: Date.now(),
         status: 'Sukses'
       });
 
       setTxStatus({
         type: 'success',
-        message: `Simulasi Berhasil: Sukses membeli ${quantity} fraksi kepemilikan ${propertyName}!`
+        message: `Sukses membeli ${quantity} fraksi on-chain di blok #${receipt.blockNumber}!`
       });
-    }, 1000);
+
+      // Refresh data kuota & portofolio on-chain secara instan
+      await fetchBlockchainData(account);
+    } catch (err) {
+      console.error("Transaksi on-chain gagal:", err);
+      let errMsg = "Transaksi dibatalkan atau gagal dieksekusi.";
+
+      // Deteksi pesan revert cooldown dari Smart Contract
+      if (err.reason) {
+        errMsg = err.reason;
+      } else if (err.message && (err.message.includes("cooldown") || err.message.includes("Harap tunggu"))) {
+        errMsg = "Revert Smart Contract: Harap tunggu periode cooldown selesai sebelum melakukan investasi lagi!";
+      } else if (err.message && err.message.includes("user rejected")) {
+        errMsg = "Transaksi ditolak oleh pengguna di MetaMask.";
+      } else if (err.shortMessage) {
+        errMsg = err.shortMessage;
+      }
+      setTxStatus({ type: 'error', message: errMsg });
+    } finally {
+      setIsTransacting(false);
+    }
   };
 
   // ---------------------------------------------------------------------------
-  // 9. TATA LETAK JSX (RETURN UI)
+  // 11. TATA LETAK JSX (RETURN UI)
   // ---------------------------------------------------------------------------
   return (
     <div className="app-container">
@@ -209,7 +392,7 @@ export default function App() {
       <Navbar
         account={account}
         onConnect={handleConnectWallet}
-        isConnecting={false}
+        isConnecting={isConnecting}
         connectError={null}
         onDismissConnectError={() => {}}
       />
